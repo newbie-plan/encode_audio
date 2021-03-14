@@ -4,8 +4,9 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
+#include <libavformat/avformat.h>
 
-static void encode(AVCodecContext *cdc_ctx, AVFrame *frame, AVPacket *pkt, FILE *fp_out)
+static void encode(AVCodecContext *cdc_ctx, AVFrame *frame, AVPacket *pkt, AVFormatContext *out_fmt_ctx)
 {
 	int ret = 0;
 
@@ -17,8 +18,14 @@ static void encode(AVCodecContext *cdc_ctx, AVFrame *frame, AVPacket *pkt, FILE 
 
 	while ((ret = avcodec_receive_packet(cdc_ctx, pkt)) >= 0)
 	{
-		printf("Write (size=%d) packet.\n", pkt->size);
-		fwrite(pkt->data, 1, pkt->size, fp_out);
+		printf("Write (size=%d) packet : pts = [%d].\n", pkt->size, pkt->pts);
+
+		if ((ret = av_interleaved_write_frame(out_fmt_ctx, pkt)) < 0)
+		{
+			fprintf(stderr, "av_interleaved_write_frame failed : [%s]\n", av_err2str(ret));
+			exit(1);
+		}
+
 		av_packet_unref(pkt);
 	}
 
@@ -37,7 +44,9 @@ void encode_audio(const char *input_file, const char *output_file)
 	AVCodecContext *cdc_ctx = NULL;
 	AVPacket *pkt = NULL;
 	AVFrame *frame = NULL;
-	FILE *fp_in, *fp_out;
+	FILE *fp_in;
+	AVFormatContext *out_fmt_ctx = NULL;
+	AVStream *audio_stream = NULL;
 
 	if ((codec = avcodec_find_encoder(AV_CODEC_ID_MP3)) == NULL)
 	{
@@ -57,6 +66,7 @@ void encode_audio(const char *input_file, const char *output_file)
 	cdc_ctx->sample_rate = 44100;
 	cdc_ctx->channel_layout = av_get_channel_layout("stereo");
 	cdc_ctx->channels = av_get_channel_layout_nb_channels(cdc_ctx->channel_layout);
+	cdc_ctx->time_base = (AVRational){44100, 1};
 
 #else 	/*encode 16k.pcm*/
 	cdc_ctx->bit_rate = 64000;
@@ -64,6 +74,7 @@ void encode_audio(const char *input_file, const char *output_file)
 	cdc_ctx->sample_rate = 16000;
 	cdc_ctx->channel_layout = av_get_channel_layout("mono");
 	cdc_ctx->channels = av_get_channel_layout_nb_channels(cdc_ctx->channel_layout);
+	cdc_ctx->time_base = (AVRational){16000, 1};
 #endif
 
 	if ((ret = avcodec_open2(cdc_ctx, codec, NULL)) < 0)
@@ -98,10 +109,41 @@ void encode_audio(const char *input_file, const char *output_file)
 		fprintf(stderr, "fopen %s failed.\n", input_file);
 		goto ret5;
 	}
-	if ((fp_out = fopen(output_file, "wb")) == NULL)
+
+	if ((ret = avformat_alloc_output_context2(&out_fmt_ctx, NULL, NULL, output_file)) < 0)
 	{
-		fprintf(stderr, "fopen %s failed.\n", output_file);
+		fprintf(stderr, "avformat_alloc_output_context2 failed : [%s].\n", av_err2str(ret));
 		goto ret6;
+	}
+
+	if ((audio_stream = avformat_new_stream(out_fmt_ctx, codec)) == NULL)
+	{
+		fprintf(stderr, "avformat_new_stream failed.\n");
+		goto ret7;
+	}
+
+	if ((ret = avcodec_parameters_from_context(audio_stream->codecpar, cdc_ctx)) < 0)
+	{
+		fprintf(stderr, "avcodec_parameters_from_context failed : [%s].\n", av_err2str(ret));
+		goto ret7;
+	}
+
+	if (!(out_fmt_ctx->oformat->flags & AVFMT_NOFILE))
+	{
+		if (avio_open(&out_fmt_ctx->pb, output_file, AVIO_FLAG_WRITE) < 0)
+		{
+			fprintf(stderr, "avio_open failed.\n");
+			goto ret7;
+		}
+	}
+	printf("----------output----------\n");
+	av_dump_format(out_fmt_ctx, 0, output_file, 1);
+	printf("--------------------------\n");
+
+	if ((ret = avformat_write_header(out_fmt_ctx, NULL)) < 0)
+	{
+		fprintf(stderr, "avformat_write_header failed : [%s].\n", av_err2str(ret));
+		goto ret7;
 	}
 
 #if 1 		/*cdc_ctx->sample_fmt = AV_SAMPLE_FMT_FLTP*/
@@ -125,7 +167,7 @@ void encode_audio(const char *input_file, const char *output_file)
 			}
 		}
 
-		encode(cdc_ctx, frame, pkt, fp_out);
+		encode(cdc_ctx, frame, pkt, out_fmt_ctx);
 	}
 
 #else 		/*cdc_ctx->sample_fmt = AV_SAMPLE_FMT_S16P*/
@@ -142,14 +184,14 @@ void encode_audio(const char *input_file, const char *output_file)
 		
 		fread(frame->data[0], 1, data_size, fp_in);
 
-		encode(cdc_ctx, frame, pkt, fp_out);
+		encode(cdc_ctx, frame, pkt, out_fmt_ctx);
 	}
 #endif
 
-	encode(cdc_ctx, NULL, pkt, fp_out);
+	encode(cdc_ctx, NULL, pkt, out_fmt_ctx);
+	av_write_trailer(out_fmt_ctx);
 
-
-	fclose(fp_out);
+	avformat_free_context(out_fmt_ctx);
 	fclose(fp_in);
 	av_frame_free(&frame);
 	av_packet_free(&pkt);
@@ -157,7 +199,7 @@ void encode_audio(const char *input_file, const char *output_file)
 	avcodec_free_context(&cdc_ctx);
 	return;
 ret7:
-	fclose(fp_out);
+	avformat_free_context(out_fmt_ctx);
 ret6:
 	fclose(fp_in);
 ret5:
